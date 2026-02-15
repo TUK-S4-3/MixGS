@@ -68,6 +68,10 @@ conda activate mixgs
 #### d. Install requirements
 ```bash
 pip install -r requirements.txt
+# train_mixgs.py imports pytorch_lightning directly
+pip install pytorch-lightning==2.0.9.post0
+# install fused-ssim with the commit used by upstream 3DGS for torch==2.0.1 compatibility
+pip install --no-build-isolation git+https://github.com/rahul-goel/fused-ssim.git@1272e21a282342e89537159e4bad508b19b34157
 pip install ninja git+https://github.com/hturki/tiny-cuda-nn.git@ht/res-grid#subdirectory=bindings/torch
 pip install submodules/diff-gaussian-rasterization
 pip install submodules/diff-gaussian-rasterization_filter

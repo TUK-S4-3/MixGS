@@ -1,5 +1,7 @@
 lightning==2.0.9.post0
 lightning[pytorch-extra]
+pytorch-lightning==2.0.9.post0
+# fused-ssim should be installed separately with --no-build-isolation (see README.md)
 splines==0.3.0
 plyfile==0.8.1
 numpy==1.26.2
