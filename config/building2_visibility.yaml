@@ -1,0 +1,75 @@
+# Model Parameters
+model_params: {
+    model_config: {
+        name: "GaussianModel",
+        kwargs: {
+          n_offsets : 4
+        # kwargs : {} -> n_offsets: 4, 최대 detail slot 개수 설정
+        #train_mixgs.py - gaussianModel에 n_offset : 4 추가해서 학습 가능
+        #model_config = data.model_config
+        #gaussians =getattr(models, model_config["name"])(**model_config["kwargs"])
+        } 
+    },
+
+    sh_degree: 3,
+    source_path: "data/mill19/building-pixsfm/train",
+    pretrain_path: "data/coarse_gaussians/building_point_cloud.ply",
+    model_path: "",
+    images: "images",
+    resolution: 6,
+    white_background: False,
+    data_device: "cpu",
+    eval: True,
+    llffhold: None, # 97,
+    #해시 아규먼트 설정
+    hash_args: {
+        canonical_num_levels: 32,
+        canonical_level_dim: 2,
+        canonical_base_resolution: 32,
+        canonical_desired_resolution: 2048,
+        canonical_log2_hashmap_size: 22,
+        bound: 622.52
+    },
+    #네트워크 아규먼트 설정
+    network_args: {
+        depth: 1,
+        width: 64,
+        max_details : 4 #최대 detail slot 개수 설정, n_offset과 동일하게 설정해야함
+    }
+}
+
+# Pipeline Parameters
+pipeline_params: {
+    convert_SHs_python:  False,
+    compute_cov3D_python:  False,
+    debug:  False,
+    scale_min: 0.0,
+}
+
+#최적화 파라미터 설정
+optim_params: {
+    iterations: 300_000,
+    joint_start_iter: 50_000,
+    position_lr_init: 0.000032,
+    position_lr_final: 0.00000032,
+    position_lr_delay_mult: 0.01,
+    position_lr_max_steps: 300_000,
+    decoder_lr_max_steps: 300_000,
+    feature_lr: 0.0025,
+    opacity_lr: 0.05,
+    scaling_lr: 0.002,
+    rotation_lr: 0.001,
+    percent_dense: 0.01,
+    lambda_dssim: 0.2,
+    opacity_thr: 0.5,
+    encoder_lr_scale: 600,
+    decoder_lr_scale: 80,
+
+    #budget 관련 옵션 추가
+    detail_budget_total: 20000,            #총 detail 개수 제한
+    detail_budget_min: 1,                  #각 detail slot이 최소한으로 가져야 하는 detail 개수
+    visibility_temperature: 0.5,           #가시성 점수 계산 시 사용할 온도 파라미터
+    visibility_score_mode: "log_radius",       #가시성 점수 계산 방식, "radius"는 detail과 카메라 간의 거리 기반, "density"는 detail의 밀도 기반 
+}
+
+
