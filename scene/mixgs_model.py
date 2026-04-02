@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scene.network import GSDecoder, GSEncoder
+from scene.network_visibility import GSDecoder, GSEncoder #경로 수정
 import os
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
