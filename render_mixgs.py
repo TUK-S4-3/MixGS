@@ -19,7 +19,8 @@ import time
 import numpy as np
 from tqdm import tqdm
 from arguments import GroupParams
-from scene import LargeScene, MixGSModel
+from scene import LargeScene
+from scene.mixgs_model_resume import MixGSModel  #경로수정
 from scene.datasets import GSDataset
 from os import makedirs
 from gaussian_renderer import prefilter_voxel, render_mix
