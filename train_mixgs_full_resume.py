@@ -252,11 +252,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
                     "xyz": gaussians.get_xyz[vis_mask].detach().cpu(),
                     "scaling": gaussians.get_scaling[vis_mask].detach().cpu(),
                     "rotation": gaussians.get_rotation[vis_mask].detach().cpu(),
-            }
+                }
 
-            debug_dir = os.path.join(log_writer.log_dir, "visibility_debug")
-            os.makedirs(debug_dir, exist_ok=True)
-            torch.save(payload, os.path.join(debug_dir, f"visibility_iter_{iteration}.pt"))
+                log_dir = getattr(log_writer, "log_dir", dataset.model_path)
+                debug_dir = os.path.join(log_dir, "visibility_debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                torch.save(payload, os.path.join(debug_dir, f"visibility_iter_{iteration}.pt"))
 
             # hash_input = [gaussians.get_xyz[vis_mask].detach(), gaussians.get_scaling[vis_mask].detach(), gaussians.get_rotation[vis_mask].detach()]
             hash_input = [
