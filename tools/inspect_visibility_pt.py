@@ -5,12 +5,14 @@
 #.pt 전용 확인 스크립트
 
 import torch
+import csv
 from argparse import ArgumentParser
 
 def main():
     parser = ArgumentParser()
     parser.add_argument("--pt", type=str, required=True)
     parser.add_argument("--top_k", type=int, default=10)
+    parser.add_argument("--csv_out", type=str, default="")
     args = parser.parse_args()
 
     x = torch.load(args.pt)
@@ -42,6 +44,20 @@ def main():
             f"score={vals[rank].item():.6f} "
             f"xyz={xyz[idx[rank]].tolist()}"
         )
+
+    if args.csv_out:
+        with open(args.csv_out, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["rank", "global_id", "score", "x", "y", "z"])
+            for rank in range(topk):
+                p = xyz[idx[rank]].tolist()
+                writer.writerow([
+                    rank + 1,
+                    global_ids[idx[rank]].item(),
+                    vals[rank].item(),
+                    p[0], p[1], p[2]
+                ])
+        print(f"\nsaved csv: {args.csv_out}")
 
 if __name__ == "__main__":
     main()
