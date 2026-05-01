@@ -1,0 +1,7 @@
+data/
+output/
+tmp_build/
+__pycache__/
+*.pyc
+cameras.json
+input.ply

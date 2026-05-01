@@ -1,13 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
 import time
 import yaml
 import os
@@ -22,22 +12,107 @@ from scene.datasets import GSDataset, CacheDataLoader
 from utils.camera_utils import loadCam
 from utils.general_utils import safe_state, parse_cfg
 from tqdm import tqdm
-from os import makedirs
 from utils.image_utils import psnr
 from utils.log_utils import tensorboard_log_image, wandb_log_image
 from argparse import ArgumentParser, Namespace
 from lpipsPyTorch import lpips
 from fused_ssim import fused_ssim
+#from gaussian_renderer import render_mix
+import csv
+from scene.budget_allocator import BudgetAllocator
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter_iterations, checkpoint_iterations,
-             checkpoint, max_cache_num, debug_from):
+@torch.no_grad()
+def estimate_baseline_budget(vis_mask: torch.Tensor, opt) -> int:
+    if getattr(opt, "fixed_budget", -1) > 0:
+        return int(opt.fixed_budget)
+    return int(vis_mask.sum().item())
+
+def append_budget_log_csv(log_dir, iteration, vis_count, base_budget, target_budget, allocated_budget, alloc_1, alloc_2, alloc_3):
+    os.makedirs(log_dir, exist_ok=True)
+    csv_path = os.path.join(log_dir, "budget_log.csv")
+    file_exists = os.path.exists(csv_path)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "iteration",
+                "vis",
+                "base_budget",
+                "target_budget",
+                "allocated",
+                "alloc1",
+                "alloc2",
+                "alloc3",
+            ])
+        writer.writerow([
+            iteration,
+            vis_count,
+            base_budget,
+            target_budget,
+            allocated_budget,
+            alloc_1,
+            alloc_2,
+            alloc_3,
+        ])
+
+@torch.no_grad()
+def build_budgeted_decoding_inputs(
+    gaussians,
+    cam_info,
+    gt_image,
+    pipe,
+    background,
+    allocator,
+    opt,
+):
+    vis_mask = prefilter_voxel(cam_info, gaussians, pipe, background)
+    vis_count = int(vis_mask.sum().item())
+
+    if vis_count == 0:
+        empty_counts = torch.empty(0, dtype=torch.long, device="cuda")
+        empty_idx = torch.empty(0, dtype=torch.long, device="cuda")
+        return vis_mask, empty_counts, empty_idx, 0, 0
+
+    base_budget = estimate_baseline_budget(vis_mask, opt)
+    target_budget = int(base_budget * getattr(opt, "budget_ratio", 1.0))
+
+    importance = allocator.compute_importance(
+        viewpoint_camera=cam_info,
+        pc=gaussians,
+        vis_mask=vis_mask,
+        gt_image=gt_image,
+        pipe=pipe,
+        bg_color=background,
+    )
+
+    alloc_counts = allocator.allocate(importance, target_budget)
+    expanded_idx = allocator.expand_indices(alloc_counts)
+
+    return vis_mask, alloc_counts, expanded_idx, base_budget, target_budget
+
+
+def training(
+    dataset,
+    opt,
+    pipe,
+    testing_iterations,
+    saving_iterations,
+    refilter_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    max_cache_num,
+    debug_from,
+):
     first_iter = 0
     log_writer, image_logger = prepare_output_and_logger(dataset)
 
-    modules = __import__('scene')
+    modules = __import__("scene")
     model_config = dataset.model_config
-    gaussians = getattr(modules, model_config['name'])(dataset.sh_degree, **model_config['kwargs'])
+    gaussians = getattr(modules, model_config["name"])(
+        dataset.sh_degree, **model_config["kwargs"]
+    )
 
     mixgs = MixGSModel(
         hash_args=dataset.hash_args,
@@ -45,11 +120,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     )
     mixgs.train_setting(opt)
 
+    allocator = BudgetAllocator(
+        min_count=1,
+        max_count=3,
+    )
+
     scene = LargeScene(dataset, gaussians)
     gs_dataset = GSDataset(scene.getTrainCameras(), scene, dataset, pipe)
+
     if len(gs_dataset) > 0:
-        print(f"Using maximum cache size of {max_cache_num} for {len(gs_dataset)} training images")
-        data_loader = CacheDataLoader(gs_dataset, max_cache_num=max_cache_num, seed=42, batch_size=1, shuffle=True, num_workers=8)
+        print(
+            f"Using maximum cache size of {max_cache_num} for {len(gs_dataset)} training images"
+        )
+        data_loader = CacheDataLoader(
+            gs_dataset,
+            max_cache_num=max_cache_num,
+            seed=42,
+            batch_size=1,
+            shuffle=True,
+            num_workers=8,
+        )
 
     gaussians.training_setup(opt)
     if checkpoint:
@@ -69,6 +159,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     iteration = first_iter
+
     while iteration <= opt.iterations:
         if len(gs_dataset) == 0:
             print("No training data found")
@@ -79,30 +170,69 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
         for dataset_index, (cam_info, gt_image) in enumerate(data_loader):
             iter_start.record()
 
-            # Render
             start = time.time()
             if (iteration - 1) == debug_from:
                 pipe.debug = True
 
-            vis_mask = prefilter_voxel(cam_info, gaussians, pipe, background)
-            hash_input = [gaussians.get_xyz[vis_mask].detach(), gaussians.get_scaling[vis_mask].detach(), gaussians.get_rotation[vis_mask].detach()]
-            decoded_data = mixgs.step(hash_input, cam_info['world_view_transform'][-1, :-1])
+            gt_image = gt_image.cuda()
+
+            (
+                vis_mask,
+                alloc_counts,
+                expanded_idx,
+                base_budget,
+                target_budget,
+            ) = build_budgeted_decoding_inputs(
+                gaussians=gaussians,
+                cam_info=cam_info,
+                gt_image=gt_image,
+                pipe=pipe,
+                background=background,
+                allocator=allocator,
+                opt=opt,
+            )
+
+            vis_xyz = gaussians.get_xyz[vis_mask].detach()
+            vis_scaling = gaussians.get_scaling[vis_mask].detach()
+            vis_rotation = gaussians.get_rotation[vis_mask].detach()
+
+            hash_input = [
+                vis_xyz[expanded_idx],
+                vis_scaling[expanded_idx],
+                vis_rotation[expanded_idx],
+            ]
+
+            decoded_data = mixgs.step(
+                hash_input,
+                cam_info["world_view_transform"][-1, :-1],
+            )
 
             if iteration == opt.joint_start_iter:
                 gaussians.gaussian_training()
 
-            render_pkg = render_mix(cam_info, gaussians, pipe, background, vis_mask, decoded_data)
+            render_pkg = render_mix(
+                cam_info,
+                gaussians,
+                pipe,
+                background,
+                vis_mask,
+                decoded_data,
+                expanded_idx=expanded_idx,
+            )
 
-            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
-                "viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+            image = render_pkg["render"]
+            viewspace_point_tensor = render_pkg["viewspace_points"]
+            visibility_filter = render_pkg["visibility_filter"]
+            radii = render_pkg["radii"]
+
             end = time.time()
             ema_time_render = 0.4 * (end - start) + 0.6 * ema_time_render
 
-            # Loss
             start = time.time()
-            gt_image = gt_image.cuda()
             Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
+                1.0 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            )
 
             loss.backward()
             end = time.time()
@@ -111,57 +241,110 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
             iter_end.record()
 
             with torch.no_grad():
-                # Progress bar
                 ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
                 if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}"})
                     progress_bar.update(10)
                 if iteration == opt.iterations:
                     progress_bar.close()
 
                 grads = gaussians.xyz_gradient_accum / gaussians.denom
                 grads[grads.isnan()] = 0.0
+                mean_grad = grads.mean().item() if grads.numel() > 0 else 0.0
+
+                vis_count = int(vis_mask.sum().item())
+                alloc_1 = int((alloc_counts == 1).sum().item())
+                alloc_2 = int((alloc_counts == 2).sum().item())
+                alloc_3 = int((alloc_counts == 3).sum().item())
+                allocated_budget = int(alloc_counts.sum().item())
+
                 ema_time = {
                     "render": ema_time_render,
                     "loss": ema_time_loss,
                     "densify": ema_time_densify,
                     "num_points": radii.shape[0],
-                    "mean_grad": grads.mean().item(),
+                    "mean_grad": mean_grad,
+                    "num_visible_anchors": vis_count,
+                    "baseline_budget": base_budget,
+                    "target_budget": target_budget,
+                    "allocated_budget": allocated_budget,
+                    "alloc_1": alloc_1,
+                    "alloc_2": alloc_2,
+                    "alloc_3": alloc_3,
                 }
+
+                if iteration % 100 == 0:
+                    print(
+                        f"[ITER {iteration}] "
+                        f"vis={vis_count} | "
+                        f"base_budget={base_budget} | "
+                        f"target_budget={target_budget} | "
+                        f"allocated={allocated_budget} | "
+                        f"alloc1={alloc_1} alloc2={alloc_2} alloc3={alloc_3}"
+                    )
+                    append_budget_log_csv(
+                        log_dir=scene.model_path,
+                        iteration=iteration,
+                        vis_count=vis_count,
+                        base_budget=base_budget,
+                        target_budget=target_budget,
+                        allocated_budget=allocated_budget,
+                        alloc_1=alloc_1,
+                        alloc_2=alloc_2,
+                        alloc_3=alloc_3,
+                    )
 
                 lr = {}
                 for param_group in gaussians.optimizer.param_groups:
-                    lr[param_group['name']] = param_group['lr']
+                    lr[param_group["name"]] = param_group["lr"]
 
                 for param_group in mixgs.optimizer.param_groups:
-                    lr[param_group['name']] = param_group['lr']
+                    lr[param_group["name"]] = param_group["lr"]
 
-                # Log and save
-                training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_loss, ema_time, lr,
-                                iter_start.elapsed_time(iter_end), testing_iterations, scene, mixgs, (pipe, background))
+                training_report(
+                    dataset=dataset,
+                    opt=opt,
+                    log_writer=log_writer,
+                    image_logger=image_logger,
+                    iteration=iteration,
+                    Ll1=Ll1,
+                    loss=loss,
+                    l1_loss_fn=l1_loss,
+                    ema_time=ema_time,
+                    lr=lr,
+                    elapsed=iter_start.elapsed_time(iter_end),
+                    testing_iterations=testing_iterations,
+                    scene=scene,
+                    mixgs=mixgs,
+                    allocator=allocator,
+                    renderArgs=(pipe, background),
+                )
 
-                if (iteration in saving_iterations):
+                if iteration in saving_iterations:
                     print("\n[ITER {}] Saving Gaussians".format(iteration))
-                    # log_writer.log_dir
                     scene.save(iteration, log_writer.log_dir)
                     mixgs.save_weights(log_writer.log_dir, iteration)
 
-                if (iteration in refilter_iterations):
+                if iteration in refilter_iterations:
                     print("\n[ITER {}] Refiltering Training Data".format(iteration))
                     gs_dataset = GSDataset(scene.getTrainCameras(), scene, dataset, pipe)
 
-                # Optimizer step
                 if iteration < opt.iterations:
                     gaussians.optimizer.step()
                     gaussians.update_learning_rate(iteration)
+
                     mixgs.optimizer.step()
+
                     gaussians.optimizer.zero_grad(set_to_none=True)
                     mixgs.optimizer.zero_grad()
                     mixgs.update_learning_rate(iteration)
 
-                if (iteration in checkpoint_iterations):
+                if iteration in checkpoint_iterations:
                     print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                    torch.save(
+                        (gaussians.capture(), iteration),
+                        scene.model_path + "/chkpnt" + str(iteration) + ".pth",
+                    )
 
             iteration += 1
             if iteration >= opt.iterations:
@@ -171,44 +354,58 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, refilter
 def prepare_output_and_logger(args):
     if not args.model_path:
         config_name = os.path.splitext(os.path.basename(args.config))[0]
-        # time_stamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time()))
         args.model_path = os.path.join("./output/", config_name)
         if args.block_id >= 0:
             if args.block_id < args.block_dim[0] * args.block_dim[1] * args.block_dim[2]:
                 args.model_path = f"{args.model_path}/cells/cell{args.block_id}"
                 if args.logger_config is not None:
-                    args.logger_config['name'] = f"{args.logger_config['name']}_cell{args.block_id}"
+                    args.logger_config["name"] = f"{args.logger_config['name']}_cell{args.block_id}"
             else:
                 raise ValueError("Invalid block_id: {}".format(args.block_id))
 
-    # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok=True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
+    with open(os.path.join(args.model_path, "cfg_args"), "w") as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # build logger
     log_writer = None
     image_logger = None
     logger_args = {
         "save_dir": args.model_path
     }
-    if args.logger_config is None or args.logger_config['logger'] == "tensorboard":
+
+    if args.logger_config is None or args.logger_config["logger"] == "tensorboard":
         log_writer = TensorBoardLogger(**logger_args)
         image_logger = tensorboard_log_image
-    elif args.logger_config['logger'] == "wandb":
-        logger_args.update(name=args.logger_config['name'])
-        logger_args.update(project=args.logger_config['project'])
+    elif args.logger_config["logger"] == "wandb":
+        logger_args.update(name=args.logger_config["name"])
+        logger_args.update(project=args.logger_config["project"])
         log_writer = WandbLogger(**logger_args)
         image_logger = wandb_log_image
     else:
-        raise ValueError("Unknown logger: {}".format(args.logger_config['logger']))
+        raise ValueError("Unknown logger: {}".format(args.logger_config["logger"]))
 
     return log_writer, image_logger
 
 
-def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_loss, ema_time, lr, elapsed,
-                    testing_iterations, scene: LargeScene, mixgs, renderArgs):
+def training_report(
+    dataset,
+    opt,
+    log_writer,
+    image_logger,
+    iteration,
+    Ll1,
+    loss,
+    l1_loss_fn,
+    ema_time,
+    lr,
+    elapsed,
+    testing_iterations,
+    scene: LargeScene,
+    mixgs,
+    allocator,
+    renderArgs,
+):
     if log_writer:
         metrics_to_log = {
             "train_loss_patches/l1_loss": Ll1.item(),
@@ -218,28 +415,41 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
             "train_time/densify": ema_time["densify"],
             "train_time/num_points": ema_time["num_points"],
             "train_time/mean_grad": ema_time["mean_grad"],
+            "budget/num_visible_anchors": ema_time["num_visible_anchors"],
+            "budget/baseline_budget": ema_time["baseline_budget"],
+            "budget/target_budget": ema_time["target_budget"],
+            "budget/allocated_budget": ema_time["allocated_budget"],
+            "budget/alloc_1": ema_time["alloc_1"],
+            "budget/alloc_2": ema_time["alloc_2"],
+            "budget/alloc_3": ema_time["alloc_3"],
             "iter_time": elapsed,
         }
         for key, value in lr.items():
             metrics_to_log["trainer/" + key] = value
         log_writer.log_metrics(metrics_to_log, iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},
-                              {'name': 'train',
-                               'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in
-                                           range(5, 30, 5)]})
+        validation_configs = (
+            {"name": "test", "cameras": scene.getTestCameras()},
+            {
+                "name": "train",
+                "cameras": [
+                    scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+                    for idx in range(5, 30, 5)
+                ],
+            },
+        )
 
         for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
+            if config["cameras"] and len(config["cameras"]) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 ssims_test = 0.0
                 lpips_test = 0.0
-                for idx, camera in enumerate(config['cameras']):
-                    viewpoint_cam = loadCam(dataset, id, camera, 1)
+
+                for idx, camera in enumerate(config["cameras"]):
+                    viewpoint_cam = loadCam(dataset, idx, camera, 1)
                     viewpoint = {
                         "FoVx": viewpoint_cam.FoVx,
                         "FoVy": viewpoint_cam.FoVy,
@@ -250,44 +460,86 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
                         "world_view_transform": viewpoint_cam.world_view_transform,
                         "full_proj_transform": viewpoint_cam.full_proj_transform,
                     }
-                    org_img = viewpoint_cam.original_image
+                    gt_image = torch.clamp(viewpoint_cam.original_image.to("cuda"), 0.0, 1.0)
 
-                    vis_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
+                    (
+                        vis_mask,
+                        alloc_counts,
+                        expanded_idx,
+                        base_budget,
+                        target_budget,
+                    ) = build_budgeted_decoding_inputs(
+                        gaussians=scene.gaussians,
+                        cam_info=viewpoint,
+                        gt_image=gt_image,
+                        pipe=renderArgs[0],
+                        background=renderArgs[1],
+                        allocator=allocator,
+                        opt=opt,
+                    )
 
-                    hash_input = [scene.gaussians.get_xyz[vis_mask].detach(), scene.gaussians.get_scaling[vis_mask].detach(),
-                                  scene.gaussians.get_rotation[vis_mask].detach()]
-                    decoded_data = mixgs.step(hash_input, viewpoint['world_view_transform'][-1, :-1])
+                    vis_xyz = scene.gaussians.get_xyz[vis_mask].detach()
+                    vis_scaling = scene.gaussians.get_scaling[vis_mask].detach()
+                    vis_rotation = scene.gaussians.get_rotation[vis_mask].detach()
 
-                    render_pkg = render_mix(viewpoint, scene.gaussians, *renderArgs, vis_mask, decoded_data)
+                    hash_input = [
+                        vis_xyz[expanded_idx],
+                        vis_scaling[expanded_idx],
+                        vis_rotation[expanded_idx],
+                    ]
+                    decoded_data = mixgs.step(
+                        hash_input,
+                        viewpoint["world_view_transform"][-1, :-1],
+                    )
+
+                    render_pkg = render_mix(
+                        viewpoint,
+                        scene.gaussians,
+                        *renderArgs,
+                        vis_mask,
+                        decoded_data,
+                        expanded_idx=expanded_idx,
+                    )
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(org_img.to("cuda"), 0.0, 1.0)
 
                     if log_writer and (idx < 5):
-                        grid = torchvision.utils.make_grid(torch.concat([image, gt_image], dim=-1))
+                        grid = torchvision.utils.make_grid(
+                            torch.concat([image, gt_image], dim=-1)
+                        )
                         image_logger(
                             log_writer=log_writer,
-                            tag=config['name'] + "_view_{}".format(viewpoint["image_name"]),
+                            tag=config["name"] + "_view_{}".format(viewpoint["image_name"]),
                             image_tensor=grid,
                             step=iteration,
                         )
-                    l1_test += l1_loss(image, gt_image).mean().double()
+
+                    l1_test += l1_loss_fn(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssims_test += ssim(image, gt_image).mean().double()
-                    lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
+                    lpips_test += lpips(image, gt_image, net_type="vgg").mean().double()
 
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])
-                ssims_test /= len(config['cameras'])
-                lpips_test /= len(config['cameras'])
+                psnr_test /= len(config["cameras"])
+                l1_test /= len(config["cameras"])
+                ssims_test /= len(config["cameras"])
+                lpips_test /= len(config["cameras"])
 
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, ssims_test, lpips_test))
+                print(
+                    "\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(
+                        iteration,
+                        config["name"],
+                        l1_test,
+                        psnr_test,
+                        ssims_test,
+                        lpips_test,
+                    )
+                )
                 if log_writer:
                     metrics_to_log = {
-                        config['name'] + '/loss_viewpoint/l1_loss': l1_test,
-                        config['name'] + '/loss_viewpoint/psnr': psnr_test,
-                        config['name'] + '/loss_viewpoint/ssim': ssims_test,
-                        config['name'] + '/loss_viewpoint/lpips': lpips_test,
+                        config["name"] + "/loss_viewpoint/l1_loss": l1_test,
+                        config["name"] + "/loss_viewpoint/psnr": psnr_test,
+                        config["name"] + "/loss_viewpoint/ssim": ssims_test,
+                        config["name"] + "/loss_viewpoint/lpips": lpips_test,
                     }
                     log_writer.log_metrics(metrics_to_log, iteration)
 
@@ -295,23 +547,27 @@ def training_report(dataset, log_writer, image_logger, iteration, Ll1, loss, l1_
 
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument('--config', type=str, help='train config file path')
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6007)
-    parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--block_id', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
+    parser.add_argument("--config", type=str, help="train config file path")
+    parser.add_argument("--ip", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=6007)
+    parser.add_argument("--debug_from", type=int, default=-1)
+    parser.add_argument("--block_id", type=int, default=-1)
+    parser.add_argument("--detect_anomaly", action="store_true", default=False)
 
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[200_000, 250_000, 300_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[200_000, 250_000, 300_000])
+    parser.add_argument(
+        "--test_iterations", nargs="+", type=int, default=[200_000, 250_000, 300_000]
+    )
+    parser.add_argument(
+        "--save_iterations", nargs="+", type=int, default=[200_000, 250_000, 300_000]
+    )
 
     parser.add_argument("--refilter_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--max_cache_num", type=int, default=32)
+
     args = parser.parse_args(sys.argv[1:])
     with open(args.config) as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
@@ -326,8 +582,17 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp, op, pp, args.test_iterations, args.save_iterations, args.refilter_iterations,
-             args.checkpoint_iterations, args.start_checkpoint, args.max_cache_num, args.debug_from)
+    training(
+        lp,
+        op,
+        pp,
+        args.test_iterations,
+        args.save_iterations,
+        args.refilter_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.max_cache_num,
+        args.debug_from,
+    )
 
-    # All done
     print("\nTraining complete.")

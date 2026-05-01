@@ -55,6 +55,9 @@ optim_params: {
     opacity_thr: 0.5,
     encoder_lr_scale: 600.0,
     decoder_lr_scale: 80.0,
+
+    fixed_budget: 406347,
+    budget_ratio: 1.2,
 }
 
 

@@ -97,10 +97,6 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.max_cache_num = 512
-
-        self.budget_ratio = 1.0
-        self.fixed_budget = -1
-
         super().__init__(parser, "Optimization Parameters")
 
 
