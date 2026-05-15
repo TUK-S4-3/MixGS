@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from gaussian_renderer import render
 
 
 def _normalize01(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -15,13 +16,15 @@ class BudgetAllocator:
         self,
         min_count: int = 1,
         max_count: int = 3,
-        vis_weight: float = 0.6,
-        edge_weight: float = 0.4,
+        vis_weight: float = 0.25,
+        edge_weight: float = 0.15,
+        err_weight: float = 0.60,
     ):
         self.min_count = min_count
         self.max_count = max_count
         self.vis_weight = vis_weight
         self.edge_weight = edge_weight
+        self.err_weight = err_weight
 
     @torch.no_grad()
     def compute_importance(
@@ -39,12 +42,11 @@ class BudgetAllocator:
 
         device = vis_xyz.device
 
-        # gt_image expected shape: (3, H, W)
         if gt_image.dim() == 4:
             gt_image = gt_image.squeeze(0)
         gt_image = gt_image.to(device)
 
-        # 1) visibility score: inverse distance
+        # 1) visibility score
         cam_center = viewpoint_camera["camera_center"].to(device).reshape(-1)[:3]
         dist = torch.norm(vis_xyz - cam_center[None, :], dim=1)
         vis_score = 1.0 / (dist + 1e-6)
@@ -54,7 +56,7 @@ class BudgetAllocator:
             0.2989 * gt_image[0] +
             0.5870 * gt_image[1] +
             0.1140 * gt_image[2]
-        ).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        ).unsqueeze(0).unsqueeze(0)
 
         sobel_x = torch.tensor(
             [[[-1, 0, 1],
@@ -62,7 +64,7 @@ class BudgetAllocator:
               [-1, 0, 1]]],
             dtype=torch.float32,
             device=device,
-        ).unsqueeze(0)  # (1,1,3,3)
+        ).unsqueeze(0)
 
         sobel_y = torch.tensor(
             [[[-1, -2, -1],
@@ -70,39 +72,47 @@ class BudgetAllocator:
               [ 1,  2,  1]]],
             dtype=torch.float32,
             device=device,
-        ).unsqueeze(0)  # (1,1,3,3)
+        ).unsqueeze(0)
 
         grad_x = F.conv2d(gt_gray, sobel_x, padding=1)
         grad_y = F.conv2d(gt_gray, sobel_y, padding=1)
-        edge_map = torch.sqrt(grad_x ** 2 + grad_y ** 2).squeeze(0).squeeze(0)  # (H,W)
+        edge_map = torch.sqrt(grad_x ** 2 + grad_y ** 2).squeeze(0).squeeze(0)
 
-        # 3) project visible anchors to image plane
+        # 3) coarse reconstruction error map
+        coarse_pkg = render(viewpoint_camera, pc, pipe, bg_color)
+        coarse_image = coarse_pkg["render"].detach()   # (3,H,W)
+        error_map = torch.abs(coarse_image - gt_image).mean(dim=0)  # (H,W)
+
+        # 4) project visible anchors to image plane
         ones = torch.ones((vis_xyz.shape[0], 1), device=device)
-        xyz_h = torch.cat([vis_xyz, ones], dim=1)  # (N,4)
+        xyz_h = torch.cat([vis_xyz, ones], dim=1)
 
         full_proj = viewpoint_camera["full_proj_transform"].to(device)
         if full_proj.dim() == 3:
-            full_proj = full_proj.squeeze(0)  # (4,4)
+            full_proj = full_proj.squeeze(0)
 
-        clip = xyz_h @ full_proj  # (N,4)
-        ndc = clip[:, :3] / (clip[:, 3:4] + 1e-8)  # (N,3)
+        clip = xyz_h @ full_proj
+        ndc = clip[:, :3] / (clip[:, 3:4] + 1e-8)
 
         H = int(viewpoint_camera["image_height"])
         W = int(viewpoint_camera["image_width"])
 
-        px = ((ndc[:, 0] + 1.0) * 0.5 * (W - 1)).round().long()
-        py = ((1.0 - ndc[:, 1]) * 0.5 * (H - 1)).round().long()
-
-        px = px.clamp(0, W - 1)
-        py = py.clamp(0, H - 1)
+        px = ((ndc[:, 0] + 1.0) * 0.5 * (W - 1)).round().long().clamp(0, W - 1)
+        py = ((1.0 - ndc[:, 1]) * 0.5 * (H - 1)).round().long().clamp(0, H - 1)
 
         edge_score = edge_map[py, px]
+        err_score = error_map[py, px]
 
-        # 4) weighted importance
+        # 5) weighted importance
         vis_score = _normalize01(vis_score).reshape(-1)
         edge_score = _normalize01(edge_score).reshape(-1)
+        err_score = _normalize01(err_score).reshape(-1)
 
-        score = self.vis_weight * vis_score + self.edge_weight * edge_score
+        score = (
+            self.vis_weight * vis_score
+            + self.edge_weight * edge_score
+            + self.err_weight * err_score
+        )
         return score
 
     @torch.no_grad()

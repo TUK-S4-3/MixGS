@@ -66,6 +66,7 @@ def build_budgeted_decoding_inputs(
     background,
     allocator,
     opt,
+    iteration,
 ):
     vis_mask = prefilter_voxel(cam_info, gaussians, pipe, background)
     vis_count = int(vis_mask.sum().item())
@@ -86,6 +87,17 @@ def build_budgeted_decoding_inputs(
         pipe=pipe,
         bg_color=background,
     )
+
+    if iteration % 100 == 0:
+        topk = torch.topk(importance, k=min(10, importance.numel())).indices
+        print(
+            f"[ITER {iteration}] importance: "
+            f"min={importance.min().item():.6f}, "
+            f"max={importance.max().item():.6f}, "
+            f"mean={importance.mean().item():.6f}, "
+            f"top10_idx={topk.tolist()}"
+        )
+
 
     alloc_counts = allocator.allocate(importance, target_budget)
     expanded_idx = allocator.expand_indices(alloc_counts)
@@ -190,6 +202,7 @@ def training(
                 background=background,
                 allocator=allocator,
                 opt=opt,
+                iteration=iteration,
             )
 
             vis_xyz = gaussians.get_xyz[vis_mask].detach()
@@ -476,6 +489,7 @@ def training_report(
                         background=renderArgs[1],
                         allocator=allocator,
                         opt=opt,
+                        iteration=iteration,
                     )
 
                     vis_xyz = scene.gaussians.get_xyz[vis_mask].detach()
