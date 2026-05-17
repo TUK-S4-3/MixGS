@@ -171,6 +171,7 @@ def render_mix(
     vis_mask,
     decoded_data,
     expanded_idx,
+    slot_offsets=None, #slot_offsets=None 추가
     scaling_modifier=1.0,
 ):
     """
@@ -208,7 +209,11 @@ def render_mix(
     )
 
     # decoded gaussian centers = expanded anchor xyz + corresponding offset
-    means3D_decoded = anchor_xyz + anchor_offset.reshape(num_decoded, -1)
+    #추가
+    if slot_offsets is None:
+        slot_offsets = torch.zeros_like(anchor_xyz)
+
+    means3D_decoded = anchor_xyz + anchor_offset.reshape(num_decoded, -1) +slot_offsets
 
     # decoded colors
     decoded_colors = torch.sigmoid(d_sh)
