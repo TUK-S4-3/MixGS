@@ -116,7 +116,7 @@ class BudgetAllocator:
         return score
 
     @torch.no_grad()
-    def allocate(self, importance: torch.Tensor, target_budget: int) -> torch.Tensor:
+    def allocate(self, importance: torch.Tensor, target_budget: int, extra_top_ratio: float = 0.2) -> torch.Tensor:
         num_visible = importance.shape[0]
         if num_visible == 0:
             return torch.empty(0, dtype=torch.long, device=importance.device)
@@ -140,13 +140,20 @@ class BudgetAllocator:
 
         order = torch.argsort(importance, descending=True)
 
-        add_second = min(num_visible, extra)
-        alloc[order[:add_second]] += 1
+        candidate_count = int(num_visible * extra_top_ratio)
+        candidate_count = max(1, candidate_count)
+        candidate_count = min(candidate_count, num_visible)
+
+        candidates = order[:candidate_count]
+
+
+        add_second = min(candidate_count, extra)
+        alloc[candidates[:add_second]] += 1
         extra -= add_second
 
         if extra > 0:
-            add_third = min(num_visible, extra)
-            alloc[order[:add_third]] += 1
+            add_third = min(candidate_count, extra)
+            alloc[candidates[:add_third]] += 1
 
         return alloc
 
@@ -161,3 +168,29 @@ class BudgetAllocator:
             dtype=torch.long,
         )
         return torch.repeat_interleave(idx, alloc_counts)
+    
+    @torch.no_grad()
+    def expand_indices_and_slots(self, alloc_counts: torch.Tensor):
+        if alloc_counts.numel() == 0:
+            empty = torch.empty(0, dtype=torch.long, device=alloc_counts.device)
+            return empty, empty
+
+        idx = torch.arange(
+            alloc_counts.shape[0],
+            device=alloc_counts.device,
+            dtype=torch.long,
+        )
+	    #새코드
+        expanded_idx = torch.repeat_interleave(idx, alloc_counts)
+
+        slot_ids = torch.cat([
+                torch.arange(
+                    int(c.item()),
+                    device=alloc_counts.device,
+                    dtype=torch.long,
+            )
+            for c in alloc_counts
+        ], dim=0)
+
+        return expanded_idx, slot_ids
+    
