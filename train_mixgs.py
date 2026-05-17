@@ -74,7 +74,9 @@ def build_budgeted_decoding_inputs(
     if vis_count == 0:
         empty_counts = torch.empty(0, dtype=torch.long, device="cuda")
         empty_idx = torch.empty(0, dtype=torch.long, device="cuda")
-        return vis_mask, empty_counts, empty_idx, 0, 0
+        #empty_slot_ids 추가
+        empty_slot_ids = torch.empty(0, dtype=torch.long, device="cuda")
+        return vis_mask, empty_counts, empty_idx, empty_slot_ids, 0, 0
 
     base_budget = estimate_baseline_budget(vis_mask, opt)
     target_budget = int(base_budget * getattr(opt, "budget_ratio", 1.0))
@@ -100,9 +102,11 @@ def build_budgeted_decoding_inputs(
 
 
     alloc_counts = allocator.allocate(importance, target_budget)
-    expanded_idx = allocator.expand_indices(alloc_counts)
+    #수정
+    expanded_idx, slot_ids = allocator.expand_indices_and_slots(alloc_counts) #index + slot id 생성
+    #expanded_idx = allocator.expand_indices(alloc_counts) #index만 생성
 
-    return vis_mask, alloc_counts, expanded_idx, base_budget, target_budget
+    return vis_mask, alloc_counts, expanded_idx, slot_ids, base_budget, target_budget #slot_ids 추가
 
 
 def training(
@@ -192,6 +196,7 @@ def training(
                 vis_mask,
                 alloc_counts,
                 expanded_idx,
+                slot_ids, #slot_ids 추가
                 base_budget,
                 target_budget,
             ) = build_budgeted_decoding_inputs(
@@ -209,8 +214,23 @@ def training(
             vis_scaling = gaussians.get_scaling[vis_mask].detach()
             vis_rotation = gaussians.get_rotation[vis_mask].detach()
 
+            #추가
+            slot_offsets_table = torch.tensor(
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.35, 0.0, 0.0],
+                    [-0.35, 0.0, 0.0],
+                ],
+                device=vis_xyz.device,
+                dtype=vis_xyz.dtype,
+            )
+
+            slot_offsets = slot_offsets_table[slot_ids]
+            slot_offsets = slot_offsets * vis_scaling[expanded_idx].detach()
+
             hash_input = [
-                vis_xyz[expanded_idx],
+                #slot_offsets 추가
+                vis_xyz[expanded_idx] + slot_offsets,
                 vis_scaling[expanded_idx],
                 vis_rotation[expanded_idx],
             ]
@@ -231,6 +251,7 @@ def training(
                 vis_mask,
                 decoded_data,
                 expanded_idx=expanded_idx,
+                slot_offsets=slot_offsets, #slot_offsets 추가
             )
 
             image = render_pkg["render"]
@@ -479,6 +500,7 @@ def training_report(
                         vis_mask,
                         alloc_counts,
                         expanded_idx,
+                        slot_ids, #slot_ids 추가
                         base_budget,
                         target_budget,
                     ) = build_budgeted_decoding_inputs(
@@ -496,8 +518,22 @@ def training_report(
                     vis_scaling = scene.gaussians.get_scaling[vis_mask].detach()
                     vis_rotation = scene.gaussians.get_rotation[vis_mask].detach()
 
+                    #추가
+                    slot_offsets_table = torch.tensor(
+                        [
+                            [0.0, 0.0, 0.0],
+                            [0.35, 0.0, 0.0],
+                            [-0.35, 0.0, 0.0],
+                        ],
+                        device=vis_xyz.device,
+                        dtype=vis_xyz.dtype,
+                    )
+
+                    slot_offsets = slot_offsets_table[slot_ids]
+                    slot_offsets = slot_offsets * vis_scaling[expanded_idx].detach()
+
                     hash_input = [
-                        vis_xyz[expanded_idx],
+                        vis_xyz[expanded_idx] + slot_offsets ,  #slot_offsets 추가
                         vis_scaling[expanded_idx],
                         vis_rotation[expanded_idx],
                     ]
@@ -513,6 +549,7 @@ def training_report(
                         vis_mask,
                         decoded_data,
                         expanded_idx=expanded_idx,
+                        slot_offsets=slot_offsets, #slot_offsets 추가
                     )
 
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
