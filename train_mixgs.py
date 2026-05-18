@@ -57,6 +57,36 @@ def append_budget_log_csv(log_dir, iteration, vis_count, base_budget, target_bud
             alloc_3,
         ])
 
+#vramlog
+def append_vram_log_csv(log_dir, iteration):
+    os.makedirs(log_dir, exist_ok=True)
+    csv_path = os.path.join(log_dir, "vram_log.csv")
+    file_exists = os.path.exists(csv_path)
+
+    allocated_mb = torch.cuda.memory_allocated() / 1024 / 1024
+    reserved_mb = torch.cuda.memory_reserved() / 1024 / 1024
+    max_allocated_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    max_reserved_mb = torch.cuda.max_memory_reserved() / 1024 / 1024
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "iteration",
+                "allocated_mb",
+                "reserved_mb",
+                "max_allocated_mb",
+                "max_reserved_mb",
+            ])
+
+        writer.writerow([
+            iteration,
+            allocated_mb,
+            reserved_mb,
+            max_allocated_mb,
+            max_reserved_mb,
+        ])
+
 @torch.no_grad()
 def build_budgeted_decoding_inputs(
     gaussians,
@@ -184,6 +214,7 @@ def training(
             break
 
         for dataset_index, (cam_info, gt_image) in enumerate(data_loader):
+            torch.cuda.reset_peak_memory_stats()
             iter_start.record()
 
             start = time.time()
@@ -327,6 +358,11 @@ def training(
                         alloc_2=alloc_2,
                         alloc_3=alloc_3,
                     )
+                    #vram log 추가
+                    append_vram_log_csv(
+                        log_dir=scene.model_path,
+                        iteration=iteration,
+                        )
 
                 lr = {}
                 for param_group in gaussians.optimizer.param_groups:
