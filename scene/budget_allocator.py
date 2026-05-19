@@ -168,29 +168,33 @@ class BudgetAllocator:
             dtype=torch.long,
         )
         return torch.repeat_interleave(idx, alloc_counts)
-    
+
+
     @torch.no_grad()
     def expand_indices_and_slots(self, alloc_counts: torch.Tensor):
         if alloc_counts.numel() == 0:
             empty = torch.empty(0, dtype=torch.long, device=alloc_counts.device)
             return empty, empty
 
+        num_visible = alloc_counts.shape[0]
+        max_count = int(self.max_count)
+
         idx = torch.arange(
-            alloc_counts.shape[0],
+            num_visible,
             device=alloc_counts.device,
             dtype=torch.long,
         )
-	    #새코드
-        expanded_idx = torch.repeat_interleave(idx, alloc_counts)
 
-        slot_ids = torch.cat([
-                torch.arange(
-                    int(c.item()),
-                    device=alloc_counts.device,
-                    dtype=torch.long,
-            )
-            for c in alloc_counts
-        ], dim=0)
+        slot_range = torch.arange(
+            max_count,
+            device=alloc_counts.device,
+            dtype=torch.long,
+        )
+
+        mask = slot_range[None, :] < alloc_counts[:, None]
+
+        expanded_idx = idx[:, None].expand(-1, max_count)[mask]
+        slot_ids = slot_range[None, :].expand(num_visible, -1)[mask]
 
         return expanded_idx, slot_ids
     
